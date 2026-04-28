@@ -1,1 +1,57 @@
-testing
+name: TikTok Ads → BigQuery Sync
+
+on:
+  schedule:
+    - cron: "0 4 * * *"  # 4:00 AM UTC = 9:00 AM PKT
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Days to sync (default 3)"
+        required: false
+        default: "3"
+      backfill_start:
+        description: "Backfill start date (YYYY-MM-DD)"
+        required: false
+        default: ""
+      backfill_end:
+        description: "Backfill end date (YYYY-MM-DD)"
+        required: false
+        default: ""
+
+jobs:
+  sync:
+    name: Sync TikTok Ads to BigQuery
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install requests google-cloud-bigquery google-auth
+
+      - name: Run TikTok sync
+        env:
+          TIKTOK_ACCESS_TOKEN: ${{ secrets.TIKTOK_ACCESS_TOKEN }}
+          TIKTOK_ADVERTISER_ID: ${{ secrets.TIKTOK_ADVERTISER_ID }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          BQ_DATASET: ${{ secrets.BQ_DATASET || 'TikTok' }}
+          BQ_LOCATION: "US"
+          TIKTOK_LOOKBACK_DAYS: ${{ github.event.inputs.days || '3' }}
+        run: |
+          if [ -n "${{ github.event.inputs.backfill_start }}" ] && [ -n "${{ github.event.inputs.backfill_end }}" ]; then
+            python tiktok_sync.py \
+              --backfill-start "${{ github.event.inputs.backfill_start }}" \
+              --backfill-end "${{ github.event.inputs.backfill_end }}"
+          else
+            python tiktok_sync.py \
+              --days "${{ github.event.inputs.days || '3' }}"
+          fi
