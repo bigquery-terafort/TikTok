@@ -35,7 +35,7 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install requests google-cloud-bigquery google-auth
+        run: pip install -r requirements.txt
 
       - name: Run TikTok sync
         env:
@@ -43,7 +43,7 @@ jobs:
           TIKTOK_ADVERTISER_ID: ${{ secrets.TIKTOK_ADVERTISER_ID }}
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
-          BQ_DATASET: ${{ secrets.BQ_DATASET || 'TikTok' }}
+          BQ_DATASET: "TikTok"
           BQ_LOCATION: "US"
           TIKTOK_LOOKBACK_DAYS: ${{ github.event.inputs.days || '3' }}
         run: |
