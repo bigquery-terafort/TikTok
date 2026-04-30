@@ -1,10 +1,15 @@
 """
-TikTok Ads → BigQuery Full Sync
-================================
+TikTok Ads → BigQuery Full Sync (v2)
+====================================
 Extracts ALL available data from TikTok Marketing API v1.3:
   - 9 report tables (daily performance at every level + audience breakdowns)
-  - 3 dimension tables (campaigns, adgroups, ads)
+  - 4 dimension tables (campaigns, adgroups, ads, APPS)
   - 1 sync log table
+
+CHANGES IN v2:
+  - Added tiktok_apps_dim table fetched from /app/list/ endpoint
+  - Returns package_name (Android) and bundle_id (iOS) per app_id
+  - This is the bridge to terafort.cross_platform.app_master_v2
 
 Auth: Long-lived access token (doesn't expire)
 Rate limit: 600 requests/minute
@@ -214,6 +219,24 @@ SCHEMAS = {
         S("modify_time", "STRING"),
         S("image_ids", "STRING"),
         S("video_id", "STRING"),
+        S("_ingested_at", "TIMESTAMP"),
+    ],
+
+    # NEW IN v2: bridge table from TikTok app_id → package_name / bundle_id
+    "tiktok_apps_dim": [
+        S("app_id", "STRING"),
+        S("app_name", "STRING"),
+        S("package_name", "STRING"),     # Android
+        S("bundle_id", "STRING"),        # iOS
+        S("platform", "STRING"),         # 'ANDROID' / 'IOS' (canonical)
+        S("app_platform", "STRING"),     # alternate field name (some API versions)
+        S("download_url", "STRING"),
+        S("category", "STRING"),
+        S("rating", "FLOAT64"),
+        S("status", "STRING"),
+        S("create_time", "STRING"),
+        S("modify_time", "STRING"),
+        S("raw_payload_json", "STRING"), # Full API response — useful for debugging field names
         S("_ingested_at", "TIMESTAMP"),
     ],
 
@@ -516,6 +539,65 @@ def fetch_ads():
     return rows
 
 
+def fetch_apps():
+    """Fetch all apps registered for this advertiser via /app/list/.
+    Returns app metadata including package_name (Android) and bundle_id (iOS).
+    This is the bridge table from TikTok app_id → app store identifier.
+    """
+    log.info("Fetching apps...")
+    ts = now_ts()
+
+    # /app/list/ uses pagination but the response shape is slightly different
+    # from campaign/adgroup/ad endpoints. We try standard pagination first;
+    # if total_number isn't returned (some endpoints don't), we read one page.
+    items = api_get_paginated(
+        "/app/list/",
+        {"advertiser_id": ADVERTISER_ID},
+        "list",
+        label="apps"
+    )
+
+    rows = []
+    for a in items:
+        # TikTok's /app/list/ response field names vary slightly across API
+        # versions. We try multiple known names and store the raw payload
+        # for forensics.
+        package_name = (
+            a.get("package_name")
+            or a.get("android_package_name")
+            or a.get("package_id")
+        )
+        bundle_id = (
+            a.get("bundle_id")
+            or a.get("ios_bundle_id")
+            or a.get("app_bundle_id")
+        )
+        platform = (
+            a.get("platform")
+            or a.get("app_platform")
+            or a.get("os")
+        )
+
+        rows.append({
+            "app_id":           safe_str(a.get("app_id")),
+            "app_name":         safe_str(a.get("app_name") or a.get("name")),
+            "package_name":     safe_str(package_name),
+            "bundle_id":        safe_str(bundle_id),
+            "platform":         safe_str(platform),
+            "app_platform":     safe_str(a.get("app_platform")),
+            "download_url":     safe_str(a.get("download_url") or a.get("app_download_url")),
+            "category":         safe_str(a.get("category") or a.get("app_category")),
+            "rating":           safe_float(a.get("rating") or a.get("app_rating")),
+            "status":           safe_str(a.get("status") or a.get("operation_status")),
+            "create_time":      safe_str(a.get("create_time")),
+            "modify_time":      safe_str(a.get("modify_time")),
+            "raw_payload_json": json.dumps(a, default=str),
+            "_ingested_at":     ts,
+        })
+    log.info(f"  ✓ {len(rows)} apps")
+    return rows
+
+
 # =============================================================================
 # BIGQUERY
 # =============================================================================
@@ -672,7 +754,7 @@ def sync(days_back=3):
     start_date = end_date - timedelta(days=days_back - 1)
 
     log.info(f"\n{'='*60}")
-    log.info(f"TikTok Ads → BigQuery Full Sync")
+    log.info(f"TikTok Ads → BigQuery Full Sync (v2 with apps_dim)")
     log.info(f"  run_id     : {rid}")
     log.info(f"  Date range : {start_date} → {end_date}")
     log.info(f"  Advertiser : {ADVERTISER_ID}")
@@ -694,7 +776,8 @@ def sync(days_back=3):
         total_rows += load_rows(bq, "tiktok_campaigns_dim", fetch_campaigns(), truncate=True)
         total_rows += load_rows(bq, "tiktok_adgroups_dim", fetch_adgroups(), truncate=True)
         total_rows += load_rows(bq, "tiktok_ads_dim", fetch_ads(), truncate=True)
-        tables_synced += 3
+        total_rows += load_rows(bq, "tiktok_apps_dim", fetch_apps(), truncate=True)  # NEW IN v2
+        tables_synced += 4
 
         # ── REPORT TABLES (delete date range + append) ──
         log.info("\n── Report Tables ──")
@@ -768,7 +851,7 @@ def backfill(start_str, end_str):
     end_date = datetime.strptime(end_str, "%Y-%m-%d").date()
 
     log.info(f"\n{'='*60}")
-    log.info(f"TikTok Ads → BigQuery BACKFILL")
+    log.info(f"TikTok Ads → BigQuery BACKFILL (v2 with apps_dim)")
     log.info(f"  run_id     : {rid}")
     log.info(f"  Date range : {start_date} → {end_date}")
     log.info(f"{'='*60}")
@@ -783,6 +866,7 @@ def backfill(start_str, end_str):
     load_rows(bq, "tiktok_campaigns_dim", fetch_campaigns(), truncate=True)
     load_rows(bq, "tiktok_adgroups_dim", fetch_adgroups(), truncate=True)
     load_rows(bq, "tiktok_ads_dim", fetch_ads(), truncate=True)
+    load_rows(bq, "tiktok_apps_dim", fetch_apps(), truncate=True)  # NEW IN v2
 
     # Reports in 30-day chunks
     total_rows = 0
@@ -827,7 +911,7 @@ def backfill(start_str, end_str):
             "start_date": str(start_date),
             "end_date": str(end_date),
             "status": "SUCCESS",
-            "tables_synced": len(REPORTS) + 3,
+            "tables_synced": len(REPORTS) + 4,  # +4 dim tables (was +3 in v1)
             "total_rows": total_rows,
             "error_message": None,
             "duration_seconds": round(duration, 2),
@@ -842,7 +926,7 @@ def backfill(start_str, end_str):
 # =============================================================================
 
 def main():
-    p = argparse.ArgumentParser(description="TikTok Ads → BigQuery sync")
+    p = argparse.ArgumentParser(description="TikTok Ads → BigQuery sync (v2)")
     p.add_argument("--days", type=int, default=3, help="Days to sync (default: 3)")
     p.add_argument("--backfill-start", type=str, help="Backfill start YYYY-MM-DD")
     p.add_argument("--backfill-end", type=str, help="Backfill end YYYY-MM-DD")
