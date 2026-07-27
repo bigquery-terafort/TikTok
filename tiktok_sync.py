@@ -1,41 +1,65 @@
 """
-TikTok Ads → BigQuery Full Sync (v3)
-====================================
+TikTok Ads → BigQuery Full Sync (v3.1)
+======================================
 REPO: bigquery-terafort/TikTok
 
 Extracts ALL available data from TikTok Marketing API v1.3:
   - 9 report tables · 4 dimension tables (campaigns, adgroups, ads, APPS)
   - 1 sync log table
 
-🔴 v3 KE FIX (BigQuery se saabit):
+🔴 v3 KE FIX (BigQuery se saabit) — barqarar:
 
-  1. `tiktok_apps_dim` = 0 ROWS
-     v2 ka POORA MAQSAD yehi table thi — "bridge from TikTok app_id →
-     package_name / bundle_id". Bilkul khali hai. `/app/list/` kuch nahi
-     de raha aur script chup-chaap "No rows" likh ke aage barh jati thi.
-     → Isi liye manual `tiktok_app_mapping` table banani padi, aur usi mein
-       'com.xxx.yyy' placeholder tha.
-     → Aur ek app abhi bhi unmapped hai:
-           app_id 7660109995593252871 (IOS) = $20 spend
-       SQL (Ads Manager se bundle dekh kar):
-           INSERT INTO `terafort.TikTok.tiktok_app_mapping`
-             (app_id, os, package_name)
-           VALUES ('7660109995593252871', 'IOS', 'ASLI_BUNDLE_ID');
-     v3: apps_dim khali → exit(1), chup nahi.
-
-  2. DELETE fetch se PEHLE — aur `except: pass`
-         try: delete_date_range(...)
-         except Exception: pass          # ← fail chhup gaya
-         raw = fetch_report(...)         # ← fetch BAAD mein
-     api_get bar-bar fail hone pe `{}` deta hai → fetch_report khali list
-     → DELETE ho chuka, kuch load nahi.
-     v3: PEHLE fetch, phir delete. Khali pe skip.
-
-  3. Pagination adhoori ho sakti thi (page 2+ khali pe chup-chaap break)
-     aur dim tables truncate=True se load hoti hain → baaki sab uda deti.
-     v3: adhoori list pe raise.
-
+  1. `tiktok_apps_dim` = 0 ROWS — `/app/list/` kuch nahi de raha.
+     v3: apps_dim khali → run fail, chup nahi.
+  2. DELETE fetch se PEHLE + `except: pass` → v3: PEHLE fetch, phir delete.
+  3. Dimension pagination adhoori pe raise.
   4. status "SUCCESS" jhoot bolta tha → v3: PARTIAL pe exit(1).
+
+🔴 v3.1 KE FIX (v3 ka guard khud toot raha tha):
+
+  A. 🚨 ASLI BUG — `sys.exit(1)` `try:` block ke ANDAR tha.
+     `SystemExit` `BaseException` se inherit karta hai, `Exception` se NAHI.
+     Isliye `except Exception` use pakadta hi nahi tha, `status` "SUCCESS"
+     hi raha, aur `finally` ne `tiktok_sync_log` mein **status='SUCCESS'**
+     likh diya — jabke run FAIL hui. Yani fix #4 ("SUCCESS jhoot na bole")
+     apps_dim guard pe kaam hi nahi kar raha tha.
+     Saboot: 26 Jul 20:41 · 27 Jul 06:55 · 27 Jul 09:34 — teeno runs
+     failed, teeno sync_log mein SUCCESS, tables_synced=0.
+     v3.1: guard ab `RuntimeError` raise karta hai → handler pakadta hai →
+     status='FAILED' sach-much likha jaata hai.
+
+  B. `tables_synced += 4` galat tha — apps_dim load hui ho ya na ho, 4 gin
+     leta tha (aur guard se pehle exit hone pe 0 rehta tha jabke 3 dim
+     tables likhi ja chuki theen).
+     v3.1: har load ke saath +1, sach.
+
+  C. ALLOW_EMPTY_APPS_DIM=1 lagane par bhi run RED hoti thi (PARTIAL →
+     exit 1). Rozana red build = alert fatigue = asli failure ignore.
+     v3.1: jaan-boojh ke waive kiya gaya ho to status
+     "SUCCESS_APPS_DIM_WAIVED" aur **exit 0**, magar log mein LOUD warning.
+     Report table khali ho to wo ab bhi PARTIAL → exit 1 (wo ghair-mutawaqqa
+     hai).
+
+  D. `fetch_report()` ki pagination `api_get_paginated()` jaisi hard NAHI
+     thi:
+         total = data.get("page_info", {}).get("total_number", 0)
+         if len(all_rows) >= total: break
+     `total_number` gayab → 0 → `len >= 0` hamesha sach → page 1 ke baad
+     chup-chaap break, aur us adhoore set se delete+load. Abhi latent hai
+     (~60 rows/din vs PAGE_SIZE 1000) lekin volume barhte hi kaatega.
+     v3.1: declared-total ke bagair short-page tak paging, mismatch pe raise.
+
+  E. `datetime.utcnow()` deprecated (3.12+). v3.1: timezone-aware UTC.
+
+ℹ️  MAOJOODA HAALAT (27 Jul 2026, BigQuery se verify shuda):
+      tiktok_app_mapping .... 24 rows, ZERO placeholder ✅
+      adgroups_dim ......... 99/99 rows mein app_id maujood (24 distinct)
+      mapping coverage ..... 24 mein se 23 covered
+      UNMAPPED ............. app_id 7449825786103775233  ← package_name chahiye
+    Yani spend attribution manual mapping se mehfooz hai — isi liye
+    ALLOW_EMPTY_APPS_DIM=1 lagana filhaal SAHI faisla hai.
+    NOTE: docstring ka purana zikr ke 7660109995593252871 unmapped hai —
+    wo ab `com.tf.ai.voice.changer.app` pe map ho chuka hai.
 
 Auth: Long-lived access token (doesn't expire)
 Rate limit: 600 requests/minute · Max date range: 365 days · page_size ≤ 1000
@@ -48,7 +72,7 @@ import time
 import argparse
 import logging
 import requests
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from typing import Any, Dict, List, Optional
 
 from google.cloud import bigquery
@@ -67,9 +91,12 @@ GCP_PROJECT     = os.environ.get("GCP_PROJECT_ID", "").strip()
 GCP_CREDS_JSON  = os.environ.get("GCP_CREDENTIALS_JSON", "").strip()
 BQ_DATASET      = os.environ.get("BQ_DATASET", "TikTok").strip()
 BQ_LOCATION     = os.environ.get("BQ_LOCATION", "US").strip()
+# NOTE: dead knob. main() CLI ke `--days` se chalta hai; ye env var kahin
+# use nahi hota. Workflow dono bhejta hai — confusion se bachne ke liye
+# yahan rakha hai taake dikhe, lekin faisla hamesha --days ka hai.
 LOOKBACK_DAYS   = int(os.environ.get("TIKTOK_LOOKBACK_DAYS", "3"))
-# 🛡️ v3: agar apps_dim jaan-boojh ke khali chhodni ho (manual mapping pe
-#    bharosa) to ye "1" set kar do. Default: khali = FAIL.
+# 🛡️ agar apps_dim jaan-boojh ke khali chhodni ho (manual tiktok_app_mapping
+#    pe bharosa) to ye "1" set kar do. Default: khali = FAIL.
 ALLOW_EMPTY_APPS_DIM = os.environ.get("ALLOW_EMPTY_APPS_DIM", "0") == "1"
 
 BASE_URL = "https://business-api.tiktok.com/open_api/v1.3"
@@ -221,10 +248,11 @@ SCHEMAS = {
 # =============================================================================
 
 def now_ts():
-    return datetime.utcnow().isoformat()
+    # v3.1: utcnow() 3.12+ mein deprecated. Aware UTC BigQuery bhi theek parhta hai.
+    return datetime.now(timezone.utc).isoformat()
 
 def run_id_now():
-    return datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 
 def safe_float(v):
     if v is None or v == "" or v == "None":
@@ -327,9 +355,21 @@ def api_get_paginated(endpoint, params, items_key, label="call"):
 
 
 def fetch_report(report_type, data_level, dimensions, metrics, start_date, end_date, label="report"):
-    """Fetch a report with pagination."""
+    """Fetch a report with pagination.
+
+    🛡️ v3.1 FIX D — v3 mein yahan yeh tha:
+           total = data.get("page_info", {}).get("total_number", 0)
+           if len(all_rows) >= total: break
+       `total_number` gayab hone par default 0 ban jata tha, aur
+       `len(all_rows) >= 0` HAMESHA sach hota hai — yani page 1 ke baad
+       chup-chaap break, aur usi adhoore set pe delete+load. Ab:
+         - total maloom      -> usi tak paging, aakhir mein exact match lazmi
+         - total na maloom   -> short page (< PAGE_SIZE) aane tak paging
+         - beech mein khali  -> agar total kehta hai aur aana chahiye to RAISE
+    """
     all_rows = []
     page = 1
+    declared_total = None
 
     while True:
         params = {
@@ -346,19 +386,36 @@ def fetch_report(report_type, data_level, dimensions, metrics, start_date, end_d
         }
 
         data = api_get("/report/integrated/get/", params, label=f"{label}_p{page}")
-
         rows = data.get("list", [])
+
+        if declared_total is None:
+            declared_total = data.get("page_info", {}).get("total_number")
+
         if not rows:
+            # Natural end of pagination — sirf tab alarming hai jab server ne
+            # khud kaha ho ke aur rows hain.
+            if declared_total is not None and len(all_rows) < int(declared_total):
+                raise RuntimeError(
+                    f"[{label}] page {page} returned nothing but total says "
+                    f"{declared_total} (collected {len(all_rows)}) — refusing "
+                    f"a partial report; delete+load would drop the rest.")
             break
 
         all_rows.extend(rows)
 
-        total = data.get("page_info", {}).get("total_number", 0)
-        if len(all_rows) >= total:
-            break
+        if declared_total is not None:
+            if len(all_rows) >= int(declared_total):
+                break
+        elif len(rows) < PAGE_SIZE:
+            break                                   # short page = last page
 
         page += 1
         time.sleep(0.3)
+
+    if declared_total is not None and len(all_rows) != int(declared_total):
+        raise RuntimeError(
+            f"[{label}] pagination mismatch: collected {len(all_rows)} "
+            f"!= declared total {declared_total}")
 
     return all_rows
 
@@ -635,10 +692,11 @@ def sync(days_back=3):
     start_date = end_date - timedelta(days=days_back - 1)
 
     log.info(f"\n{'='*60}")
-    log.info(f"TikTok Ads → BigQuery Full Sync (v3)")
+    log.info(f"TikTok Ads → BigQuery Full Sync (v3.1)")
     log.info(f"  run_id     : {rid}")
     log.info(f"  Date range : {start_date} → {end_date}")
     log.info(f"  Advertiser : {ADVERTISER_ID}")
+    log.info(f"  apps_dim   : {'WAIVER ON (ALLOW_EMPTY_APPS_DIM=1)' if ALLOW_EMPTY_APPS_DIM else 'required'}")
     log.info(f"{'='*60}")
 
     bq = get_bq()
@@ -650,17 +708,21 @@ def sync(days_back=3):
     tables_synced = 0
     error_msg = None
     status = "SUCCESS"
+    apps_dim_waived = False          # v3.1: PARTIAL se alag rakha gaya
 
     try:
         # ── DIMENSION TABLES (truncate + reload) ──
         log.info("\n── Dimension Tables ──")
+        # 🛡️ v3.1 FIX B: har kamyab load pe +1 — pehle andhadhund `+= 4` tha.
         total_rows += load_rows(bq, "tiktok_campaigns_dim", fetch_campaigns(), truncate=True)
+        tables_synced += 1
         total_rows += load_rows(bq, "tiktok_adgroups_dim",  fetch_adgroups(),  truncate=True)
+        tables_synced += 1
         total_rows += load_rows(bq, "tiktok_ads_dim",       fetch_ads(),       truncate=True)
+        tables_synced += 1
 
         # 🛡️ FIX 1: apps_dim khali ho to CHILLAO. Ye bridge table hai —
-        #    khali rehna manual mapping pe majboori paida karta hai (aur wahi
-        #    'com.xxx.yyy' jaisa placeholder).
+        #    khali rehna manual mapping pe majboori paida karta hai.
         apps = fetch_apps()
         if not apps:
             msg = ("/app/list/ returned 0 apps — apps_dim bridge is DEAD. "
@@ -669,14 +731,23 @@ def sync(days_back=3):
                    "(Set ALLOW_EMPTY_APPS_DIM=1 to proceed knowingly.)")
             if ALLOW_EMPTY_APPS_DIM:
                 log.error(f"🚨 {msg}")
-                status = "PARTIAL"
-                error_msg = (error_msg or "") + " | apps_dim empty"
+                log.error("   → ALLOW_EMPTY_APPS_DIM=1 set hai: jaan-boojh ke "
+                          "aage barh raha hoon. Spend attribution ab poori "
+                          "tarah tiktok_app_mapping pe hai — "
+                          "tiktok_unmapped_monitor rozana dekhein.")
+                apps_dim_waived = True
+                error_msg = (error_msg or "") + " | apps_dim empty (WAIVED)"
             else:
-                log.error(f"🚨 {msg}")
-                sys.exit(1)
+                # 🛡️ v3.1 FIX A — YAHAN `sys.exit(1)` tha. SystemExit
+                # BaseException se aata hai, Exception se NAHI: neeche wala
+                # `except Exception` use pakadta hi nahi tha, `status`
+                # "SUCCESS" hi rehta tha, aur `finally` sync_log mein
+                # status='SUCCESS' likh deta tha — ek FAILED run par.
+                # Normal exception raise karo taake sach record ho.
+                raise RuntimeError(msg)
         else:
             total_rows += load_rows(bq, "tiktok_apps_dim", apps, truncate=True)
-        tables_synced += 4
+            tables_synced += 1
 
         # ── REPORT TABLES ──
         log.info("\n── Report Tables ──")
@@ -685,8 +756,6 @@ def sync(days_back=3):
             log.info(f"\nFetching {table}...")
 
             # 🛡️ FIX 2: PEHLE fetch, PHIR delete.
-            #    v2: DELETE upar (except: pass ke saath), fetch neeche —
-            #    khali API jawab pe us poore date-range ka data ghayab.
             raw  = fetch_report(
                 report_type=report["report_type"],
                 data_level=report["data_level"],
@@ -710,6 +779,12 @@ def sync(days_back=3):
             total_rows += load_rows(bq, table, rows)
             tables_synced += 1
             time.sleep(1)
+
+        # 🛡️ v3.1 FIX C: sirf apps_dim waive hua ho (aur koi report na tooti)
+        #    to ye ek MAALOOM, qubool-shuda haalat hai — build red na ho,
+        #    warna rozana red = alert fatigue = asli failure ignore.
+        if apps_dim_waived and status == "SUCCESS":
+            status = "SUCCESS_APPS_DIM_WAIVED"
 
     except Exception as e:
         status = "FAILED"
@@ -738,11 +813,18 @@ def sync(days_back=3):
         except Exception as e:
             log.warning(f"  Sync log write failed: {e}")
 
-    # 🛡️ FIX 4: "SUCCESS" jhoot na bole
-    if status != "SUCCESS":
+    # 🛡️ FIX 4 (v3.1 mein durust): "SUCCESS" jhoot na bole — magar
+    #    jaan-boojh ke waive ki hui apps_dim ko failure na ginwao.
+    if status not in ("SUCCESS", "SUCCESS_APPS_DIM_WAIVED"):
         log.error(f"🚨 Run finished with status={status} — some tables were "
                   f"NOT refreshed. See log above.")
         sys.exit(1)
+
+    if apps_dim_waived:
+        log.warning("🟡 Reports sab refresh ho gaye, lekin apps_dim KHALI hai "
+                    "(waiver on). Ye asthai hona chahiye — /app/list/ ki "
+                    "permission theek karwayein, warna naye app_id chup-chaap "
+                    "unmapped rahenge.")
 
 
 def backfill(start_str, end_str):
@@ -753,7 +835,7 @@ def backfill(start_str, end_str):
     end_date = datetime.strptime(end_str, "%Y-%m-%d").date()
 
     log.info(f"\n{'='*60}")
-    log.info(f"TikTok Ads → BigQuery BACKFILL (v3)")
+    log.info(f"TikTok Ads → BigQuery BACKFILL (v3.1)")
     log.info(f"  run_id     : {rid}")
     log.info(f"  Date range : {start_date} → {end_date}")
     log.info(f"{'='*60}")
@@ -832,7 +914,7 @@ def backfill(start_str, end_str):
 # =============================================================================
 
 def main():
-    p = argparse.ArgumentParser(description="TikTok Ads → BigQuery sync (v3)")
+    p = argparse.ArgumentParser(description="TikTok Ads → BigQuery sync (v3.1)")
     p.add_argument("--days", type=int, default=3, help="Days to sync (default: 3)")
     p.add_argument("--backfill-start", type=str, help="Backfill start YYYY-MM-DD")
     p.add_argument("--backfill-end", type=str, help="Backfill end YYYY-MM-DD")
