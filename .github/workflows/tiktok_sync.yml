@@ -54,14 +54,25 @@ jobs:
           # NOTE: script actually reads --days (CLI). TIKTOK_LOOKBACK_DAYS is a
           # dead knob in tiktok_sync.py — kept only so the two never disagree.
           TIKTOK_LOOKBACK_DAYS: ${{ github.event.inputs.days || '7' }}
-          # 🛡️ THE FIX: /app/list/ returns 0 apps, so the apps_dim guard aborts
-          # the whole run — including spend. Attribution is safe without it
-          # (tiktok_app_mapping has 24 real rows, 0 placeholders, covering 23
-          # of the 24 app_ids seen in adgroups_dim), so we proceed knowingly.
-          # Set repo Variable ALLOW_EMPTY_APPS_DIM=1. Falls back to '0' so a
-          # missing variable can never silently disable the guard.
-          # ⚠️ TEMPORARY — remove once /app/list/ permissions are restored.
-          ALLOW_EMPTY_APPS_DIM: ${{ vars.ALLOW_EMPTY_APPS_DIM || '0' }}
+          # 🛡️ THE WAIVER: /app/list/ returns 0 apps, so the apps_dim guard
+          # aborts the whole run — including spend. Attribution is safe without
+          # it (tiktok_app_mapping has 24 real rows, 0 placeholders, covering
+          # 23 of the 24 app_ids seen in adgroups_dim), so we proceed knowingly.
+          #
+          # ⚠️⚠️ TEMPORARY HARDCODE — REMOVE once /app/list/ permissions are
+          # restored in TikTok Business Center (Assets → App).
+          #
+          # Hardcoded on purpose: run #95 proved `vars.ALLOW_EMPTY_APPS_DIM`
+          # was NOT reaching the job (log showed "apps_dim : required"), most
+          # likely because the org variable's repository-access policy doesn't
+          # include this repo. Hardcoding removes that variable entirely from
+          # the critical path so spend stops bleeding today.
+          #
+          # Once the org variable is confirmed working, switch back to the
+          # safer form below — it falls back to '0', so a missing variable can
+          # never silently disarm the guard:
+          #   ALLOW_EMPTY_APPS_DIM: ${{ vars.ALLOW_EMPTY_APPS_DIM || '0' }}
+          ALLOW_EMPTY_APPS_DIM: "1"
         run: |
           if [ -n "${{ github.event.inputs.backfill_start }}" ] && [ -n "${{ github.event.inputs.backfill_end }}" ]; then
             python tiktok_sync.py \
