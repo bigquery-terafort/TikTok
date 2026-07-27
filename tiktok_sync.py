@@ -95,9 +95,21 @@ BQ_LOCATION     = os.environ.get("BQ_LOCATION", "US").strip()
 # use nahi hota. Workflow dono bhejta hai — confusion se bachne ke liye
 # yahan rakha hai taake dikhe, lekin faisla hamesha --days ka hai.
 LOOKBACK_DAYS   = int(os.environ.get("TIKTOK_LOOKBACK_DAYS", "3"))
+def _env_flag(name: str, default: str = "0") -> bool:
+    """Tolerant boolean env parsing.
+
+    v3.1 mein ye `os.environ.get(name, "0") == "1"` tha — bilkul strict.
+    GitHub Actions kabhi kabhi value ke saath whitespace/newline bhej deta
+    hai, aur insaan '1' ke saath saath 'true'/'yes' bhi likhte hain. Strict
+    match un sab ko chup-chaap ignore kar deta tha aur guard armed rehta —
+    yani flag "set kar diya" lagta tha magar asar koi nahi.
+    """
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
 # 🛡️ agar apps_dim jaan-boojh ke khali chhodni ho (manual tiktok_app_mapping
 #    pe bharosa) to ye "1" set kar do. Default: khali = FAIL.
-ALLOW_EMPTY_APPS_DIM = os.environ.get("ALLOW_EMPTY_APPS_DIM", "0") == "1"
+ALLOW_EMPTY_APPS_DIM = _env_flag("ALLOW_EMPTY_APPS_DIM")
 
 BASE_URL = "https://business-api.tiktok.com/open_api/v1.3"
 
@@ -696,7 +708,10 @@ def sync(days_back=3):
     log.info(f"  run_id     : {rid}")
     log.info(f"  Date range : {start_date} → {end_date}")
     log.info(f"  Advertiser : {ADVERTISER_ID}")
-    log.info(f"  apps_dim   : {'WAIVER ON (ALLOW_EMPTY_APPS_DIM=1)' if ALLOW_EMPTY_APPS_DIM else 'required'}")
+    # RAW value bhi dikhao — agar variable pohancha hi nahi to yahan
+    # '<unset>' ya '' dikhega, aur diagnosis ek nazar mein ho jayegi.
+    log.info(f"  apps_dim   : {'WAIVER ON' if ALLOW_EMPTY_APPS_DIM else 'required'} "
+             f"(ALLOW_EMPTY_APPS_DIM={os.environ.get('ALLOW_EMPTY_APPS_DIM', '<unset>')!r})")
     log.info(f"{'='*60}")
 
     bq = get_bq()
